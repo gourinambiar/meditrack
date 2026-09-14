@@ -1,0 +1,5 @@
+﻿node_modules/
+meditrack.db
+meditrack.db-shm
+meditrack.db-wal
+.env
