@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MediTrack — Medicine Authenticity &amp; Supply-Chain Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="app">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark">℞</span>
+      <div class="brand-text">
+        <span class="brand-name">MediTrack</span>
+        <span class="brand-sub">Provenance Ledger</span>
+      </div>
+    </div>
+    <nav id="role-nav" class="rail-nav"></nav>
+    <div class="rail-footer">
+      <div class="chain-pill" id="chain-pill">chain: —</div>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <header class="stage-header">
+      <div>
+        <h1 id="view-title">Manufacturer</h1>
+        <p id="view-sub" class="muted">Register batches and issue serialized, QR-verifiable medicine units.</p>
+      </div>
+      <div id="actor-select" class="actor-select"></div>
+    </header>
+
+    <section id="view-root" class="view-root"></section>
+  </main>
+</div>
+
+<template id="tpl-toast"><div class="toast"></div></template>
+
+<script src="app.js"></script>
+</body>
+</html>
