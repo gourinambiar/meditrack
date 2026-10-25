@@ -15,16 +15,20 @@ JS/HTML frontend with four role-based dashboards.
 ```
 meditrack/
 ├── backend/
-│   ├── server.js        # Express API — all routes
+│   ├── server.js        # Express API — all routes (every route except /api/health needs a login)
+│   ├── auth.js           # Password hashing, JWT sessions, role middleware, login throttling
+│   ├── demoUsers.js      # Creates demo logins for existing stakeholders (npm run seed:users)
 │   ├── db.js             # SQLite schema
 │   ├── blockchain.js     # Hash-chained ledger simulation ("the blockchain")
 │   ├── anomaly.js        # Rule-based anomaly detection + trust-score engine
 │   ├── seed.js            # Demo data: authentic, cold-chain-violation, cloned-QR, suspicious-transfer
+│   ├── tests/auth.test.js # Access-control test suite (npm test)
+│   ├── .env.example       # JWT_SECRET etc. — copy to .env
 │   └── package.json
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
-│   └── app.js             # SPA: Manufacturer / Supply Chain / Regulator / Patient dashboards
+│   └── app.js             # SPA: login screen + role-based Manufacturer / Supply Chain / Regulator / Verify views
 ├── contracts/
 │   └── MediTrackLedger.sol  # Reference Solidity contract for real-chain deployment
 └── README.md
@@ -59,30 +63,90 @@ implements the same guarantees a real chain gives you, directly:
 cd meditrack/backend
 npm install
 
-# 2. Seed demo data (stakeholders, batches, medicines, and 4 demo scenarios)
-npm run seed
-#   This prints demo stakeholder IDs and serial numbers to the console — keep them handy.
+# 2. (Recommended) create your config — sets the key used to sign logins
+cp .env.example .env      # Windows PowerShell: Copy-Item .env.example .env
+#   then put a long random value after JWT_SECRET= (the file shows how to generate one).
+#   Skipping this works too, but everyone is signed out whenever the server restarts.
 
-# 3. Start the API server (http://localhost:4000)
+# 3. Seed demo data (stakeholders, batches, medicines, demo logins, and 4 demo scenarios)
+npm run seed
+#   This prints the demo logins and the demo serial numbers — keep them handy.
+
+# 4. Start the API server (http://localhost:4000)
 npm start
 
-# 4. In a second terminal, serve the frontend (any static server works)
+# 5. In a second terminal, serve the frontend (any static server works)
 cd ../frontend
 npx serve -l 5500
 #   or: python3 -m http.server 5500
 
-# 5. Open http://localhost:5500 in your browser
+# 6. Open http://localhost:5500 and sign in (see section 4)
 ```
 
 The frontend talks to the API at `http://localhost:4000` (see `API` constant at the top of
 `frontend/app.js` — change it if you deploy the backend elsewhere).
 
-Re-running `npm run seed` wipes and repopulates `meditrack.db` with fresh demo data — safe to do at
-any time to reset the demo.
+Re-running `npm run seed` wipes and repopulates `meditrack.db` with fresh demo data (including the
+logins) — safe to do at any time to reset the demo.
 
-## 4. Demo walkthrough
+**Upgrading an existing database** (one created before logins existed) **without losing data:** start
+the server once (it adds the new `users` table automatically), then run `npm run seed:users`. That
+creates a login for every authorized stakeholder that doesn't have one yet and never touches
+medicines, transfers or ledger blocks. It is safe to run repeatedly.
 
-The seed script prints four serial numbers. Use the **Patient — Scan & Verify** tab to try them:
+**Run the tests:** `npm test` (from `backend/`) runs the access-control suite against a throwaway
+database — it never touches your real `meditrack.db`.
+
+## 4. Accounts, login and access control
+
+Every account belongs to exactly one stakeholder on the network, and the **server** decides who you
+are from your signed login token — the browser can no longer choose an identity or send someone
+else's ID.
+
+**Demo logins** (created by `npm run seed`; password for all: `Meditrack@123`, override with
+`DEMO_PASSWORD`). The sign-in screen has one-click chips for these:
+
+| Username | Role | What they can do |
+|---|---|---|
+| `manufacturer` | Manufacturer | Register batches, ship units onward, view own stock |
+| `distributor`, `wholesaler`, `pharmacy` | Supply chain | See units they hold, transfer them onward, log cold-chain readings |
+| `regulator` | Regulator | Network overview, anomaly log, ledger audit, onboard/suspend participants |
+| `patient` | Patient | Scan & Verify only |
+
+All roles can use **Scan & Verify**. Anyone can create a **patient** account from the sign-up tab;
+every other role is onboarded by a regulator (Regulator tab → *Onboard a participant*). *Unverified
+Reseller Co.* deliberately has no login — it is the unauthorized party in the suspicious-transfer demo.
+
+What the server enforces:
+
+- **Identity from the token.** `from_id` / `manufacturer_id` / `scanned_by` in request bodies are
+  ignored; the sender is always the logged-in stakeholder.
+- **Only the current holder can transfer or log temperatures** for a unit — mirroring
+  `require(med.currentOwner == msg.sender)` in the Solidity contract. A non-holder attempt is
+  rejected (403) without touching the unit's trust score, so nobody can lower a competitor's score
+  by spamming attempts.
+- **Role gates** on every route (e.g. only manufacturers register batches, only regulators read
+  `/api/regulator/*` or onboard/suspend participants).
+- **Scoped reads.** Non-regulators only list units they hold and can open a unit's detail/QR/timeline
+  only if they manufactured, hold, or previously held it. Everyone else uses Scan & Verify.
+- **Suspension takes effect immediately.** Accounts are re-checked on every request, so suspending a
+  participant ends their open sessions and any transfer to them fails the authorization check.
+  (The old `force` flag that bypassed that check has been removed.)
+- **Passwords** are hashed with scrypt + a per-user salt; login errors are generic and equal-cost
+  for unknown usernames; 5 failed attempts per username/IP triggers a 15-minute lockout.
+- **Output escaping.** Because patients can self-register, every server-supplied string is
+  HTML-escaped before it is rendered.
+
+Known limits of this prototype (worth fixing before real use): the login lockout is in-memory (resets
+on restart and isn't shared between servers); tokens live in `sessionStorage` (cleared when the tab
+closes, but readable by any script on the page — an HttpOnly cookie plus CSRF protection would be
+stronger); there is no password reset or change-password flow, no MFA, and no HTTPS (terminate TLS in
+front of the API); and the demo password is public by design — turn off `SHOW_DEMO_ACCOUNTS` in
+`frontend/app.js` and set a private `DEMO_PASSWORD` for anything beyond a demo.
+
+## 5. Demo walkthrough
+
+The seed script prints four serial numbers. Sign in as `patient` (or any account) and open **Scan & Verify** to try them:
 
 | Scenario | What it demonstrates |
 |---|---|
@@ -92,16 +156,16 @@ The seed script prints four serial numbers. Use the **Patient — Scan & Verify*
 | `suspiciousTransfer` | The deliberate **suspicious transfer scenario**: the manufacturer transfers directly to an unregistered/unauthorized reseller (skipping distributor/wholesaler), which is then immediately re-transferred — triggering `UNAUTHORIZED_PARTICIPANT`, `SUSPICIOUS_MOVEMENT_PATTERN`, and `RAPID_REPEATED_TRANSFER` flags. |
 
 Other things to try:
-- **Manufacturer tab** → register a new batch → click a resulting unit to see its generated QR
-  code and empty timeline.
-- **Supply Chain tab** → switch the "Acting as" dropdown between distributor/wholesaler/pharmacy,
-  hold a unit, and transfer it onward. Try transferring to the seeded **Unverified Reseller Co.** —
-  the smart-contract layer rejects it outright (HTTP 403) rather than silently recording it.
-  Also try logging an out-of-range temperature reading on a cold-chain batch.
-- **Regulator tab** → see network-wide totals by classification, the live blockchain-integrity
-  check, and the full anomaly log across all units.
+- Sign in as **`manufacturer`** → register a new batch → click a resulting unit to see its generated
+  QR code and timeline → *Ship a unit* to **MedLine Distributors**.
+- Sign out, sign in as **`distributor`** → the shipped unit is now in your custody → transfer it onward
+  to **CareWell Pharmacy**. Try transferring to **Unverified Reseller Co.** — the smart-contract layer
+  rejects it outright (HTTP 403) and logs the attempt. Also try logging an out-of-range temperature
+  reading on a cold-chain unit you hold.
+- Sign in as **`regulator`** → network-wide totals, the live blockchain-integrity check, the anomaly
+  log, and *Network participants* — suspend the distributor, then see their open session end.
 
-## 5. Anomaly detection rules implemented
+## 6. Anomaly detection rules implemented
 
 All in `backend/anomaly.js`, each deducting points from a starting score of 100:
 
@@ -118,7 +182,7 @@ All in `backend/anomaly.js`, each deducting points from a starting score of 100:
 
 Score → classification: **≥75 Authentic/Safe · 40–74 Suspicious · <40 Potentially Counterfeit**.
 
-## 6. What represents the research novelty
+## 7. What represents the research novelty
 
 A conventional blockchain medicine-tracking system typically stops at: *put each transfer on an
 immutable ledger, let anyone look up the history*. MediTrack's novelty is the layer built on top of
@@ -144,7 +208,7 @@ that ledger:
 5. **Cold-chain integrity folded into the same trust score** as counterfeit detection, so a unit
    that is provably authentic but was mishandled in transit doesn't get a false "safe" signal.
 
-## 7. Notes on the smart contract layer
+## 8. Notes on the smart contract layer
 
 `backend/server.js` + `backend/anomaly.js` implement the same invariants a Solidity contract would
 enforce with `require()` statements — see `contracts/MediTrackLedger.sol` for the literal EVM

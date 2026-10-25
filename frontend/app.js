@@ -1,27 +1,54 @@
 const API = 'http://localhost:4000/api';
+const SESSION_KEY = 'meditrack.session';
 
-const ROLES = [
-  { key: 'manufacturer', label: 'Manufacturer', sub: 'Register batches and issue serialized, QR-verifiable medicine units.' },
-  { key: 'supplychain', label: 'Distributor / Wholesaler / Pharmacy', sub: 'Receive stock and transfer custody forward through the chain.' },
-  { key: 'regulator', label: 'Regulator', sub: 'Monitor the network, review flagged activity, and audit the ledger.' },
-  { key: 'patient', label: 'Patient — Scan & Verify', sub: 'Scan a QR code or enter a serial number to check authenticity.' },
-];
+// Demo convenience only: shows one-click demo logins on the sign-in screen.
+// Set to false for any real deployment (and change DEMO_PASSWORD on the server).
+const SHOW_DEMO_ACCOUNTS = true;
+const DEMO_PASSWORD = 'Meditrack@123';
+const DEMO_USERS = ['manufacturer', 'distributor', 'wholesaler', 'pharmacy', 'patient', 'regulator'];
+
+const VIEWS = {
+  manufacturer: { label: 'Manufacturer', sub: 'Register batches and issue serialized, QR-verifiable medicine units.' },
+  supplychain: { label: 'Supply Chain', sub: 'Receive stock and transfer custody forward through the chain.' },
+  regulator: { label: 'Regulator', sub: 'Monitor the network, review flagged activity, and audit the ledger.' },
+  verify: { label: 'Scan & Verify', sub: 'Scan a QR code or enter a serial number to check authenticity.' },
+};
+
+// Which screens each account type sees. This only shapes the UI — the
+// server enforces the same rules on every request.
+const VIEWS_BY_ROLE = {
+  manufacturer: ['manufacturer', 'verify'],
+  distributor: ['supplychain', 'verify'],
+  wholesaler: ['supplychain', 'verify'],
+  pharmacy: ['supplychain', 'verify'],
+  regulator: ['regulator', 'verify'],
+  patient: ['verify'],
+};
 
 const state = {
-  role: 'manufacturer',
-  actorsByRole: {},
-  actorId: {},
+  view: null,
+  user: null,
+  token: null,
 };
 
 // ------------------------------------------------------------------ utils
-async function api(path, opts) {
-  const res = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
+// Everything that came from the server (names, serials, notes...) is
+// escaped before it goes into innerHTML. Patients can now self-register,
+// so a name like "<img onerror=...>" must never be able to run as markup.
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  const res = await fetch(API + path, { ...opts, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // An expired/invalid session anywhere in the app sends you back to sign-in.
+    if (res.status === 401 && state.token) logout('Your session has expired — please sign in again.');
     const err = new Error(data.error || 'Request failed');
+    err.status = res.status;
     err.data = data;
     throw err;
   }
@@ -48,21 +75,148 @@ function scoreClass(classification) {
 }
 
 function badge(classification) {
-  return `<span class="badge ${scoreClass(classification)}">${classification}</span>`;
+  return `<span class="badge ${scoreClass(classification)}">${esc(classification)}</span>`;
 }
 
-// ------------------------------------------------------------------ nav
+// ------------------------------------------------------------------ session
+function saveSession() {
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify({ token: state.token }));
+}
+
+function clearSession() {
+  state.token = null;
+  state.user = null;
+  state.view = null;
+  sessionStorage.removeItem(SESSION_KEY);
+}
+
+function logout(message) {
+  clearSession();
+  showLogin(message);
+}
+
+function startSession({ token, user }) {
+  state.token = token;
+  state.user = user;
+  saveSession();
+  enterApp();
+}
+
+// ------------------------------------------------------------------ login screen
+function showLogin(message) {
+  document.getElementById('app').hidden = true;
+  const screen = document.getElementById('login-screen');
+  screen.hidden = false;
+
+  const demo = SHOW_DEMO_ACCOUNTS
+    ? `<div class="demo-accounts">
+         <div class="demo-title">Demo accounts <span>(password: ${esc(DEMO_PASSWORD)})</span></div>
+         <div class="demo-chips">${DEMO_USERS.map((u) => `<button type="button" class="chip" data-demo="${u}">${u}</button>`).join('')}</div>
+       </div>`
+    : '';
+
+  screen.innerHTML = `
+    <div class="login-card">
+      <div class="login-brand"><span class="brand-mark">℞</span><div><div class="brand-name">MediTrack</div><div class="login-sub">Provenance Ledger</div></div></div>
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="signin" role="tab">Sign in</button>
+        <button class="tab-btn" data-tab="signup" role="tab">Patient sign-up</button>
+      </div>
+      <div class="error-text" id="login-error" role="alert" aria-live="polite">${esc(message || '')}</div>
+
+      <form id="signin-form" autocomplete="on">
+        <div class="field"><label for="si-user">Username</label><input id="si-user" name="username" autocomplete="username" required /></div>
+        <div class="field"><label for="si-pass">Password</label><input id="si-pass" name="password" type="password" autocomplete="current-password" required /></div>
+        <button class="btn" type="submit" style="width:100%;justify-content:center">Sign in</button>
+      </form>
+
+      <form id="signup-form" autocomplete="on" hidden>
+        <p class="hint">Patient accounts can be created here. Manufacturers, distributors, wholesalers, pharmacies and regulators are onboarded by the regulator.</p>
+        <div class="field"><label for="su-name">Full name</label><input id="su-name" name="name" maxlength="80" autocomplete="name" required /></div>
+        <div class="field"><label for="su-loc">City (optional)</label><input id="su-loc" name="location" maxlength="80" autocomplete="address-level2" /></div>
+        <div class="field"><label for="su-user">Username</label><input id="su-user" name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9._\\-]+" title="Letters, digits, . _ -" required /></div>
+        <div class="field"><label for="su-pass">Password (min 8 characters)</label><input id="su-pass" name="password" type="password" autocomplete="new-password" minlength="8" required /></div>
+        <button class="btn" type="submit" style="width:100%;justify-content:center">Create account</button>
+      </form>
+      ${demo}
+    </div>
+  `;
+
+  const errorBox = screen.querySelector('#login-error');
+  const signin = screen.querySelector('#signin-form');
+  const signup = screen.querySelector('#signup-form');
+
+  screen.querySelectorAll('[data-tab]').forEach((btn) => {
+    btn.onclick = () => {
+      screen.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b === btn));
+      signin.hidden = btn.dataset.tab !== 'signin';
+      signup.hidden = btn.dataset.tab !== 'signup';
+      errorBox.textContent = '';
+    };
+  });
+
+  screen.querySelectorAll('[data-demo]').forEach((chip) => {
+    chip.onclick = () => {
+      signin.querySelector('[name=username]').value = chip.dataset.demo;
+      signin.querySelector('[name=password]').value = DEMO_PASSWORD;
+      signin.requestSubmit();
+    };
+  });
+
+  async function submit(form, path, body) {
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    errorBox.textContent = '';
+    try {
+      startSession(await api(path, { method: 'POST', body: JSON.stringify(body) }));
+    } catch (err) {
+      errorBox.textContent = err.message;
+      btn.disabled = false;
+    }
+  }
+
+  signin.onsubmit = (e) => {
+    e.preventDefault();
+    const fd = new FormData(signin);
+    submit(signin, '/auth/login', { username: fd.get('username').trim(), password: fd.get('password') });
+  };
+  signup.onsubmit = (e) => {
+    e.preventDefault();
+    const fd = new FormData(signup);
+    submit(signup, '/auth/signup', {
+      name: fd.get('name').trim(),
+      location: fd.get('location').trim(),
+      username: fd.get('username').trim(),
+      password: fd.get('password'),
+    });
+  };
+}
+
+// ------------------------------------------------------------------ app shell
+function allowedViews() {
+  return VIEWS_BY_ROLE[state.user.role] || [];
+}
+
+function enterApp() {
+  document.getElementById('login-screen').hidden = true;
+  document.getElementById('app').hidden = false;
+  state.view = allowedViews()[0];
+  renderNav();
+  renderHeader();
+  renderView();
+}
+
 function renderNav() {
   const nav = document.getElementById('role-nav');
   nav.innerHTML = '';
-  ROLES.forEach((r) => {
+  allowedViews().forEach((key) => {
     const btn = document.createElement('button');
-    btn.className = 'rail-btn' + (state.role === r.key ? ' active' : '');
-    btn.innerHTML = `<span class="dot"></span>${r.label}`;
-    btn.onclick = async () => {
-      state.role = r.key;
+    btn.className = 'rail-btn' + (state.view === key ? ' active' : '');
+    btn.innerHTML = `<span class="dot"></span>${esc(VIEWS[key].label)}`;
+    btn.onclick = () => {
+      state.view = key;
       renderNav();
-      await renderHeader();
+      renderHeader();
       renderView();
     };
     nav.appendChild(btn);
@@ -70,11 +224,18 @@ function renderNav() {
   refreshChainPill();
 }
 
-async function renderHeader() {
-  const r = ROLES.find((x) => x.key === state.role);
-  document.getElementById('view-title').textContent = r.label;
-  document.getElementById('view-sub').textContent = r.sub;
-  await renderActorSelect();
+function renderHeader() {
+  const v = VIEWS[state.view];
+  document.getElementById('view-title').textContent = v.label;
+  document.getElementById('view-sub').textContent = v.sub;
+
+  const box = document.getElementById('actor-select');
+  box.innerHTML = `
+    <div class="whoami">
+      <div><span class="whoami-label">Signed in as</span><strong>${esc(state.user.name)}</strong> <em>${esc(state.user.role)}</em></div>
+      <button class="btn secondary" id="logout-btn" type="button">Sign out</button>
+    </div>`;
+  box.querySelector('#logout-btn').onclick = () => logout();
 }
 
 async function refreshChainPill() {
@@ -86,72 +247,27 @@ async function refreshChainPill() {
   }
 }
 
-// ------------------------------------------------------------------ actor selector
-async function loadActors(roleFilter) {
-  if (state.actorsByRole[roleFilter]) return state.actorsByRole[roleFilter];
-  const list = await api(`/stakeholders?role=${roleFilter}`);
-  state.actorsByRole[roleFilter] = list;
-  return list;
-}
-
-async function renderActorSelect() {
-  const box = document.getElementById('actor-select');
-  box.innerHTML = '';
-  if (state.role === 'manufacturer') {
-    const list = await loadActors('manufacturer');
-    box.innerHTML = actorPicker('manufacturer', list, 'Acting as manufacturer');
-  } else if (state.role === 'supplychain') {
-    const [d, w, p] = await Promise.all([
-      loadActors('distributor'),
-      loadActors('wholesaler'),
-      loadActors('pharmacy'),
-    ]);
-    const all = [...d, ...w, ...p];
-    box.innerHTML = actorPicker('supplychain', all, 'Acting as');
-  } else if (state.role === 'patient') {
-    const list = await loadActors('patient');
-    box.innerHTML = actorPicker('patient', list, 'Scanning as');
-  } else {
-    return;
-  }
-  const sel = box.querySelector('select');
-  if (sel) {
-    state.actorId[state.role] = sel.value;
-    sel.onchange = () => {
-      state.actorId[state.role] = sel.value;
-      renderView();
-    };
-  }
-}
-
-function actorPicker(key, list, labelText) {
-  if (!list.length) return `<div class="muted">No stakeholders of this type registered yet.</div>`;
-  const current = state.actorId[key] || list[0].id;
-  state.actorId[key] = current;
-  return `<label>${labelText}</label>
-    <select>${list.map((s) => `<option value="${s.id}" ${s.id === current ? 'selected' : ''}>${s.name} — ${s.role}${s.is_authorized ? '' : ' (UNAUTHORIZED)'}</option>`).join('')}</select>`;
-}
-
 // ------------------------------------------------------------------ view dispatch
 async function renderView() {
   const root = document.getElementById('view-root');
   root.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
-    if (state.role === 'manufacturer') await viewManufacturer(root);
-    else if (state.role === 'supplychain') await viewSupplyChain(root);
-    else if (state.role === 'regulator') await viewRegulator(root);
-    else if (state.role === 'patient') await viewPatient(root);
+    if (state.view === 'manufacturer') await viewManufacturer(root);
+    else if (state.view === 'supplychain') await viewSupplyChain(root);
+    else if (state.view === 'regulator') await viewRegulator(root);
+    else if (state.view === 'verify') await viewPatient(root);
   } catch (e) {
-    root.innerHTML = `<div class="empty-state">Could not load this view. Is the backend running at ${API}?<br><span class="hash">${e.message}</span></div>`;
+    if (!state.token) return; // we were just signed out
+    root.innerHTML = `<div class="empty-state">Could not load this view. Is the backend running at ${esc(API)}?<br><span class="hash">${esc(e.message)}</span></div>`;
   }
   refreshChainPill();
 }
 
 // ------------------------------------------------------------------ Manufacturer
 async function viewManufacturer(root) {
-  const actorId = state.actorId.manufacturer;
+  const actorId = state.user.stakeholder_id;
   const [medicines, allStakeholders] = await Promise.all([
-    actorId ? api(`/medicines?owner_id=${actorId}`) : [],
+    api('/medicines'),
     api('/stakeholders'),
   ]);
   const downstream = allStakeholders.filter((s) => ['distributor', 'wholesaler', 'pharmacy'].includes(s.role));
@@ -190,15 +306,15 @@ async function viewManufacturer(root) {
         <div class="field-row">
           <div class="field">
             <label>Medicine (serial number)</label>
-            <select name="medicine_id">${medicines.filter((m) => m.status === 'registered').map((m) => `<option value="${m.id}">${m.serial_number} — ${m.medicine_name}</option>`).join('') || '<option disabled>No unshipped units</option>'}</select>
+            <select name="medicine_id">${medicines.filter((m) => m.status === 'registered').map((m) => `<option value="${m.id}">${esc(m.serial_number)} — ${esc(m.medicine_name)}</option>`).join('') || '<option disabled>No unshipped units</option>'}</select>
           </div>
           <div class="field">
             <label>Ship to</label>
-            <select name="to_id">${downstream.map((s) => `<option value="${s.id}">${s.name} — ${s.role}${s.is_authorized ? '' : ' ⚠ UNAUTHORIZED'}</option>`).join('') || '<option disabled>No distributors registered</option>'}</select>
+            <select name="to_id">${downstream.map((s) => `<option value="${s.id}">${esc(s.name)} — ${esc(s.role)}${s.is_authorized ? '' : ' ⚠ UNAUTHORIZED'}</option>`).join('') || '<option disabled>No distributors registered</option>'}</select>
           </div>
         </div>
         <div class="field"><label>Note (optional)</label><input name="note" placeholder="e.g. bulk shipment to regional distributor" /></div>
-        <button class="btn" type="submit" ${medicines.some((m) => m.status === 'registered') ? '' : 'disabled'}>Ship unit</button>
+        <button class="btn" type="submit" ${esc(medicines.some((m) => m.status === 'registered') ? '' : 'disabled')}>Ship unit</button>
       </form>
       <div id="ship-result"></div>
     </div>
@@ -213,7 +329,6 @@ async function viewManufacturer(root) {
     const fd = new FormData(e.target);
     const body = {
       medicine_name: fd.get('medicine_name'),
-      manufacturer_id: actorId,
       manufacturing_date: fd.get('manufacturing_date'),
       expiry_date: fd.get('expiry_date'),
       quantity: fd.get('quantity'),
@@ -240,19 +355,18 @@ async function viewManufacturer(root) {
           method: 'POST',
           body: JSON.stringify({
             medicine_id: fd.get('medicine_id'),
-            from_id: actorId,
             to_id: fd.get('to_id'),
             actor_note: fd.get('note'),
           }),
         });
         const flagsHtml = result.flags.length
-          ? result.flags.map((f) => `<div class="alert-box ${f.severity === 'medium' ? 'medium' : ''}"><span class="a-type">${f.type}</span>${f.description}</div>`).join('')
+          ? result.flags.map((f) => `<div class="alert-box ${f.severity === 'medium' ? 'medium' : ''}"><span class="a-type">${esc(f.type)}</span>${esc(f.description)}</div>`).join('')
           : '<div class="hint">No anomalies detected on this shipment.</div>';
         document.getElementById('ship-result').innerHTML = `<div style="margin-top:14px">${flagsHtml}</div>`;
         toast('Unit shipped and committed to the ledger.');
         renderView();
       } catch (err) {
-        document.getElementById('ship-result').innerHTML = `<div class="alert-box" style="margin-top:14px"><span class="a-type">SHIPMENT REJECTED</span>${err.message}</div>`;
+        document.getElementById('ship-result').innerHTML = `<div class="alert-box" style="margin-top:14px"><span class="a-type">SHIPMENT REJECTED</span>${esc(err.message)}</div>`;
         toast('Smart contract rejected this shipment.', true);
       }
     };
@@ -268,9 +382,9 @@ function renderMedList(medicines) {
       (m) => `
     <div class="med-card" data-id="${m.id}" style="cursor:pointer">
       <div>
-        <div class="name">${m.medicine_name}</div>
-        <div class="serial">${m.serial_number}</div>
-        <div class="meta">Expires ${m.expiry_date} · status: ${m.status}</div>
+        <div class="name">${esc(m.medicine_name)}</div>
+        <div class="serial">${esc(m.serial_number)}</div>
+        <div class="meta">Expires ${esc(m.expiry_date)} · status: ${esc(m.status)}</div>
       </div>
       ${badge(m.classification)}
     </div>`
@@ -296,8 +410,8 @@ async function openMedicineDetail(id) {
     ${back}
     <div class="grid-2" style="margin-top:18px">
       <div class="panel">
-        <h2>${med.medicine_name}</h2>
-        <p class="hint">${med.serial_number}</p>
+        <h2>${esc(med.medicine_name)}</h2>
+        <p class="hint">${esc(med.serial_number)}</p>
         <div class="verify-result">
           <div class="qr-wrap"><img src="${qr.dataUrl}" width="180" height="180" /></div>
           ${badge(med.classification)}
@@ -305,7 +419,7 @@ async function openMedicineDetail(id) {
         </div>
         <div class="field" style="margin-top:14px">
           <label>Manufactured</label>
-          <div>${med.manufacturing_date} → expires ${med.expiry_date}</div>
+          <div>${esc(med.manufacturing_date)} → expires ${esc(med.expiry_date)}</div>
         </div>
       </div>
       <div class="panel">
@@ -314,7 +428,7 @@ async function openMedicineDetail(id) {
           ${timeline.transfers
             .map(
               (t) => `<div class="timeline-item ${t.flagged ? 'flagged' : ''}">
-                <div class="t-role">${t.from ? t.from.name : 'Manufacturer'} → ${t.to.name}</div>
+                <div class="t-role">${esc(t.from ? t.from.name : 'Manufacturer')} → ${esc(t.to.name)}</div>
                 <div class="t-meta">block #${t.block_index} · ${fmtDate(t.timestamp)}</div>
                 ${t.flagged ? '<div class="t-note">⚠ flagged by anomaly detection</div>' : ''}
               </div>`
@@ -329,9 +443,9 @@ async function openMedicineDetail(id) {
 
 // ------------------------------------------------------------------ Supply chain
 async function viewSupplyChain(root) {
-  const actorId = state.actorId.supplychain;
+  const actorId = state.user.stakeholder_id;
   const [held, stakeholders] = await Promise.all([
-    actorId ? api(`/medicines?owner_id=${actorId}`) : [],
+    api('/medicines'),
     api('/stakeholders'),
   ]);
 
@@ -348,13 +462,13 @@ async function viewSupplyChain(root) {
         <form id="transfer-form">
           <div class="field">
             <label>Medicine (serial number)</label>
-            <select name="medicine_id">${held.map((m) => `<option value="${m.id}">${m.serial_number} — ${m.medicine_name}</option>`).join('') || '<option disabled>No units held</option>'}</select>
+            <select name="medicine_id">${held.map((m) => `<option value="${m.id}">${esc(m.serial_number)} — ${esc(m.medicine_name)}</option>`).join('') || '<option disabled>No units held</option>'}</select>
           </div>
           <div class="field">
             <label>Transfer to</label>
             <select name="to_id">${stakeholders
-              .filter((s) => s.id !== actorId)
-              .map((s) => `<option value="${s.id}">${s.name} — ${s.role}${s.is_authorized ? '' : ' ⚠ UNAUTHORIZED'}</option>`)
+              .filter((s) => s.id !== actorId && s.role !== 'regulator')
+              .map((s) => `<option value="${s.id}">${esc(s.name)} — ${esc(s.role)}${s.is_authorized ? '' : ' ⚠ UNAUTHORIZED'}</option>`)
               .join('')}</select>
           </div>
           <div class="field"><label>Note (optional)</label><input name="note" placeholder="e.g. cold-chain shipment to regional hub" /></div>
@@ -370,7 +484,7 @@ async function viewSupplyChain(root) {
         <div class="field-row">
           <div class="field">
             <label>Medicine</label>
-            <select name="medicine_id">${held.map((m) => `<option value="${m.id}">${m.serial_number} — ${m.medicine_name}</option>`).join('') || '<option disabled>No units held</option>'}</select>
+            <select name="medicine_id">${held.map((m) => `<option value="${m.id}">${esc(m.serial_number)} — ${esc(m.medicine_name)}</option>`).join('') || '<option disabled>No units held</option>'}</select>
           </div>
           <div class="field"><label>Temperature (°C)</label><input type="number" step="0.1" name="temperature" value="5" /></div>
         </div>
@@ -387,20 +501,19 @@ async function viewSupplyChain(root) {
         method: 'POST',
         body: JSON.stringify({
           medicine_id: fd.get('medicine_id'),
-          from_id: actorId,
           to_id: fd.get('to_id'),
           actor_note: fd.get('note'),
         }),
       });
       const flagsHtml = result.flags.length
-        ? result.flags.map((f) => `<div class="alert-box ${f.severity === 'critical' || f.severity === 'high' ? '' : 'medium'}"><span class="a-type">${f.type}</span>${f.description}</div>`).join('')
+        ? result.flags.map((f) => `<div class="alert-box ${f.severity === 'critical' || f.severity === 'high' ? '' : 'medium'}"><span class="a-type">${esc(f.type)}</span>${esc(f.description)}</div>`).join('')
         : '<div class="hint">No anomalies detected on this transfer.</div>';
       document.getElementById('transfer-result').innerHTML = `<div style="margin-top:14px">${flagsHtml}</div>`;
       toast('Transfer committed to the ledger.');
       renderView();
     } catch (err) {
-      const flagsHtml = (err.data?.flags || []).map((f) => `<div class="alert-box"><span class="a-type">${f.type}</span>${f.description}</div>`).join('');
-      document.getElementById('transfer-result').innerHTML = `<div class="alert-box" style="margin-top:14px"><span class="a-type">TRANSFER REJECTED</span>${err.message}</div>${flagsHtml}`;
+      const flagsHtml = (err.data?.flags || []).map((f) => `<div class="alert-box"><span class="a-type">${esc(f.type)}</span>${esc(f.description)}</div>`).join('');
+      document.getElementById('transfer-result').innerHTML = `<div class="alert-box" style="margin-top:14px"><span class="a-type">TRANSFER REJECTED</span>${esc(err.message)}</div>${flagsHtml}`;
       toast('Smart contract rejected this transfer.', true);
     }
   };
@@ -410,11 +523,15 @@ async function viewSupplyChain(root) {
     tempForm.onsubmit = async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      const result = await api('/temperature', {
-        method: 'POST',
-        body: JSON.stringify({ medicine_id: fd.get('medicine_id'), temperature: Number(fd.get('temperature')) }),
-      });
-      toast(result.violation ? 'Temperature violation logged and flagged.' : 'Temperature reading logged — within range.', result.violation);
+      try {
+        const result = await api('/temperature', {
+          method: 'POST',
+          body: JSON.stringify({ medicine_id: fd.get('medicine_id'), temperature: Number(fd.get('temperature')) }),
+        });
+        toast(result.violation ? 'Temperature violation logged and flagged.' : 'Temperature reading logged — within range.', result.violation);
+      } catch (err) {
+        toast(err.message, true);
+      }
     };
   }
 
@@ -423,8 +540,13 @@ async function viewSupplyChain(root) {
 
 // ------------------------------------------------------------------ Regulator
 async function viewRegulator(root) {
-  const overview = await api('/regulator/overview');
-  const anomalies = await api('/regulator/anomalies');
+  const [overview, anomalies, stakeholders] = await Promise.all([
+    api('/regulator/overview'),
+    api('/regulator/anomalies'),
+    api('/stakeholders'),
+  ]);
+  const partners = stakeholders.filter((s) => s.role !== 'patient');
+  const patientCount = stakeholders.length - partners.length;
 
   const totalsByClass = Object.fromEntries(overview.byClass.map((c) => [c.classification, c.c]));
 
@@ -452,8 +574,8 @@ async function viewRegulator(root) {
                 .slice(0, 40)
                 .map(
                   (a) => `<div class="alert-box ${a.severity === 'medium' ? 'medium' : ''}" data-id="${a.medicine_id}" style="cursor:pointer">
-                    <span class="a-type">${a.type} · ${a.medicine_name} · ${a.serial_number}</span>
-                    ${a.description}
+                    <span class="a-type">${esc(a.type)} · ${esc(a.medicine_name)} · ${esc(a.serial_number)}</span>
+                    ${esc(a.description)}
                     <div class="t-meta" style="margin-top:4px">${fmtDate(a.timestamp)}</div>
                   </div>`
                 )
@@ -462,11 +584,94 @@ async function viewRegulator(root) {
         }
       </div>
     </div>
+
+    <div class="grid-2" style="margin-top:22px">
+      <div class="panel">
+        <h2>Network participants</h2>
+        <p class="hint">Suspending a participant signs them out immediately, blocks their login, and makes any transfer to them fail the smart-contract authorization check. ${patientCount} registered patient(s) not listed.</p>
+        <div class="card-list">
+          ${partners
+            .map(
+              (s) => `<div class="med-card">
+                <div>
+                  <div class="name">${esc(s.name)}</div>
+                  <div class="meta">${esc(s.role)}${s.location ? ' · ' + esc(s.location) : ''}</div>
+                </div>
+                <div style="display:flex;gap:10px;align-items:center">
+                  <span class="badge ${s.is_authorized ? 'safe' : 'counterfeit'}">${s.is_authorized ? 'Authorized' : 'Suspended'}</span>
+                  <button class="btn secondary" data-toggle="${s.id}" data-next="${s.is_authorized ? 'false' : 'true'}" ${s.id === state.user.stakeholder_id ? 'disabled title="You cannot change your own access"' : ''}>${s.is_authorized ? 'Suspend' : 'Reinstate'}</button>
+                </div>
+              </div>`
+            )
+            .join('')}
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Onboard a participant</h2>
+        <p class="hint">Creates the stakeholder on the network and issues their login. Share the temporary password through a secure channel.</p>
+        <form id="onboard-form" autocomplete="off">
+          <div class="field"><label>Organization name</label><input name="name" maxlength="80" required /></div>
+          <div class="field-row">
+            <div class="field"><label>Role</label>
+              <select name="role">
+                <option value="manufacturer">Manufacturer</option>
+                <option value="distributor">Distributor</option>
+                <option value="wholesaler">Wholesaler</option>
+                <option value="pharmacy">Pharmacy</option>
+                <option value="regulator">Regulator</option>
+              </select>
+            </div>
+            <div class="field"><label>Location</label><input name="location" maxlength="80" /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Username</label><input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9._\\-]+" title="Letters, digits, . _ -" required /></div>
+            <div class="field"><label>Temporary password</label><input name="password" type="password" minlength="8" autocomplete="new-password" required /></div>
+          </div>
+          <button class="btn" type="submit">Create participant</button>
+        </form>
+      </div>
+    </div>
   `;
 
   root.querySelectorAll('#anomaly-list [data-id]').forEach((el) => {
     el.onclick = () => openMedicineDetail(el.dataset.id);
   });
+
+  root.querySelectorAll('[data-toggle]').forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api(`/stakeholders/${btn.dataset.toggle}/authorize`, {
+          method: 'PATCH',
+          body: JSON.stringify({ is_authorized: btn.dataset.next === 'true' }),
+        });
+        toast(btn.dataset.next === 'true' ? 'Participant reinstated.' : 'Participant suspended.');
+        renderView();
+      } catch (err) {
+        toast(err.message, true);
+      }
+    };
+  });
+
+  root.querySelector('#onboard-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/stakeholders', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: fd.get('name').trim(),
+          role: fd.get('role'),
+          location: fd.get('location').trim(),
+          username: fd.get('username').trim(),
+          password: fd.get('password'),
+        }),
+      });
+      toast('Participant created — they can sign in now.');
+      renderView();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
 }
 
 // ------------------------------------------------------------------ Patient / Scan
@@ -493,41 +698,43 @@ async function viewPatient(root) {
   root.querySelector('#scan-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const actorId = state.actorId.patient;
-    const result = await api('/scan', {
-      method: 'POST',
-      body: JSON.stringify({
-        serial_number: fd.get('serial_number').trim(),
-        scanned_by: actorId,
-        scan_location: fd.get('scan_location') || undefined,
-      }),
-    });
-    renderScanResult(result);
+    try {
+      const result = await api('/scan', {
+        method: 'POST',
+        body: JSON.stringify({
+          serial_number: fd.get('serial_number').trim(),
+          scan_location: fd.get('scan_location') || undefined,
+        }),
+      });
+      renderScanResult(result);
+    } catch (err) {
+      toast(err.message, true);
+    }
   };
 }
 
 function renderScanResult(result) {
   const box = document.getElementById('scan-result');
   if (!result.found) {
-    box.innerHTML = `<h2>Result</h2><div class="alert-box"><span class="a-type">NOT FOUND</span>${result.message}</div>`;
+    box.innerHTML = `<h2>Result</h2><div class="alert-box"><span class="a-type">NOT FOUND</span>${esc(result.message)}</div>`;
     return;
   }
   const med = result.medicine;
   const flagsHtml = result.newFlags.length
-    ? result.newFlags.map((f) => `<div class="alert-box ${f.severity === 'medium' ? 'medium' : ''}"><span class="a-type">${f.type}</span>${f.description}</div>`).join('')
+    ? result.newFlags.map((f) => `<div class="alert-box ${f.severity === 'medium' ? 'medium' : ''}"><span class="a-type">${esc(f.type)}</span>${esc(f.description)}</div>`).join('')
     : '';
 
   box.innerHTML = `
     <h2>Result</h2>
     <div class="verify-result">
-      <div class="verify-headline">${med.medicine_name}</div>
+      <div class="verify-headline">${esc(med.medicine_name)}</div>
       ${badge(med.classification)}
       <div class="verify-score">trust score ${med.trust_score} / 100</div>
       <div class="score-track" style="margin:10px auto"><div class="score-fill ${scoreClass(med.classification)}" style="width:${med.trust_score}%"></div></div>
     </div>
-    <div class="field"><label>Manufacturer</label><div>${result.manufacturer?.name || 'Unknown'}</div></div>
-    <div class="field"><label>Current custody</label><div>${result.currentOwner?.name || 'Unknown'} (${result.currentOwner?.role || '—'})</div></div>
-    <div class="field"><label>Expiry</label><div>${med.expiry_date}</div></div>
+    <div class="field"><label>Manufacturer</label><div>${esc(result.manufacturer?.name || 'Unknown')}</div></div>
+    <div class="field"><label>Current custody</label><div>${esc(result.currentOwner?.name || 'Unknown')} (${esc(result.currentOwner?.role || '—')})</div></div>
+    <div class="field"><label>Expiry</label><div>${esc(med.expiry_date)}</div></div>
     ${flagsHtml}
     <div class="field">
       <label>Chain of custody</label>
@@ -550,9 +757,17 @@ function renderScanResult(result) {
 
 // ------------------------------------------------------------------ boot
 async function boot() {
-  renderNav();
-  await renderHeader();
-  renderView();
+  const saved = sessionStorage.getItem(SESSION_KEY);
+  if (saved) {
+    try {
+      state.token = JSON.parse(saved).token;
+      state.user = (await api('/auth/me')).user;
+      return enterApp();
+    } catch {
+      clearSession();
+    }
+  }
+  showLogin();
 }
 boot();
-setInterval(refreshChainPill, 15000);
+setInterval(() => { if (state.token) refreshChainPill(); }, 15000);

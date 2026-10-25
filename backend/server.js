@@ -1,3 +1,4 @@
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
@@ -5,9 +6,13 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
 const { Ledger } = require('./blockchain');
 const anomaly = require('./anomaly');
+const auth = require('./auth');
+const { authenticate, requireRole } = auth;
+
+const SUPPLY_ROLES = ['manufacturer', 'distributor', 'wholesaler', 'pharmacy'];
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true }));
 app.use(express.json());
 
 const ledger = new Ledger(db);
@@ -15,20 +20,121 @@ const ledger = new Ledger(db);
 const PORT = process.env.PORT || 4000;
 
 // ---------------------------------------------------------------------
-// Stakeholders
+// Authentication
 // ---------------------------------------------------------------------
-app.post('/api/stakeholders', (req, res) => {
-  const { name, role, location } = req.body;
-  if (!name || !role) return res.status(400).json({ error: 'name and role are required' });
-  const id = uuidv4();
-  db.prepare(
-    `INSERT INTO stakeholders (id, name, role, location, registered_at, is_authorized)
-     VALUES (?, ?, ?, ?, ?, 1)`
-  ).run(id, name, role, location || '', Date.now());
-  res.json({ id, name, role, location });
+const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/;
+
+function loginResponse(userId) {
+  const user = auth.loadUserById(userId);
+  return { token: auth.signToken(user), user: auth.publicUser(user) };
+}
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return res.status(400).json({ error: 'username and password are required' });
+  }
+  const key = auth.throttleKey(req, username);
+  if (auth.isThrottled(key)) {
+    return res.status(429).json({ error: 'Too many failed attempts — try again in 15 minutes' });
+  }
+
+  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const ok = auth.verifyPassword(password, row ? row.password_hash : auth.DUMMY_HASH) && !!row;
+  if (!ok) {
+    auth.recordFailure(key);
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+  const user = auth.loadUserById(row.id);
+  if (!user.is_authorized) {
+    return res.status(403).json({ error: 'This account has been suspended by the regulator' });
+  }
+  auth.clearFailures(key);
+  res.json(loginResponse(row.id));
 });
 
-app.get('/api/stakeholders', (req, res) => {
+// Self-service sign-up is for PATIENTS only. Manufacturers, distributors,
+// wholesalers, pharmacies and regulators are onboarded by a regulator
+// (POST /api/stakeholders), so nobody can self-declare a trusted role.
+app.post('/api/auth/signup', (req, res) => {
+  const { name, location, username, password } = req.body || {};
+  if (typeof name !== 'string' || !name.trim() || name.length > 80) {
+    return res.status(400).json({ error: 'name is required (max 80 characters)' });
+  }
+  if (location !== undefined && (typeof location !== 'string' || location.length > 80)) {
+    return res.status(400).json({ error: 'location must be at most 80 characters' });
+  }
+  if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
+    return res.status(400).json({ error: 'username must be 3–32 characters: letters, digits, . _ -' });
+  }
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
+  }
+  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+    return res.status(409).json({ error: 'that username is already taken' });
+  }
+
+  const stakeholderId = uuidv4();
+  const userId = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO stakeholders (id, name, role, location, registered_at, is_authorized)
+       VALUES (?, ?, 'patient', ?, ?, 1)`
+    ).run(stakeholderId, name.trim(), typeof location === 'string' ? location.trim() : '', Date.now());
+    return auth.createUser({ username, password, stakeholderId });
+  })();
+  res.status(201).json(loginResponse(userId));
+});
+
+app.get('/api/auth/me', authenticate, (req, res) => res.json({ user: req.user }));
+
+// Object-level access control: who may look at a given unit's detail?
+// The regulator, the manufacturer, the current holder, and anyone who has
+// held it before. Everyone else uses /api/scan, the public verification path.
+function canViewMedicine(user, med) {
+  if (user.role === 'regulator') return true;
+  if (med.manufacturer_id === user.stakeholder_id || med.current_owner_id === user.stakeholder_id) return true;
+  return !!db
+    .prepare('SELECT 1 FROM transfers WHERE medicine_id = ? AND (from_id = ? OR to_id = ?) LIMIT 1')
+    .get(med.id, user.stakeholder_id, user.stakeholder_id);
+}
+
+// ---------------------------------------------------------------------
+// Stakeholders
+// ---------------------------------------------------------------------
+// Regulator onboards a new participant and (optionally) issues its login.
+app.post('/api/stakeholders', authenticate, requireRole('regulator'), (req, res) => {
+  const { name, role, location, username, password } = req.body || {};
+  if (!name || !role) return res.status(400).json({ error: 'name and role are required' });
+  if (typeof name !== 'string' || name.length > 80 || (location && String(location).length > 80)) {
+    return res.status(400).json({ error: 'name and location must be at most 80 characters' });
+  }
+  if (!['manufacturer', 'distributor', 'wholesaler', 'pharmacy', 'regulator', 'patient'].includes(role)) {
+    return res.status(400).json({ error: 'invalid role' });
+  }
+  const withLogin = !!(username || password);
+  if (withLogin) {
+    if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
+      return res.status(400).json({ error: 'username must be 3–32 characters: letters, digits, . _ -' });
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'password must be at least 8 characters' });
+    }
+    if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+      return res.status(409).json({ error: 'that username is already taken' });
+    }
+  }
+  const id = uuidv4();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO stakeholders (id, name, role, location, registered_at, is_authorized)
+       VALUES (?, ?, ?, ?, ?, 1)`
+    ).run(id, name, role, location || '', Date.now());
+    if (withLogin) auth.createUser({ username, password, stakeholderId: id });
+  })();
+  res.status(201).json({ id, name, role, location, has_login: withLogin });
+});
+
+app.get('/api/stakeholders', authenticate, (req, res) => {
   const { role } = req.query;
   const rows = role
     ? db.prepare('SELECT * FROM stakeholders WHERE role = ?').all(role)
@@ -36,8 +142,15 @@ app.get('/api/stakeholders', (req, res) => {
   res.json(rows);
 });
 
-app.patch('/api/stakeholders/:id/authorize', (req, res) => {
+app.patch('/api/stakeholders/:id/authorize', authenticate, requireRole('regulator'), (req, res) => {
   const { is_authorized } = req.body;
+  if (typeof is_authorized !== 'boolean') return res.status(400).json({ error: 'is_authorized must be true or false' });
+  if (req.params.id === req.user.stakeholder_id) {
+    return res.status(400).json({ error: 'You cannot change your own authorization' });
+  }
+  if (!db.prepare('SELECT 1 FROM stakeholders WHERE id = ?').get(req.params.id)) {
+    return res.status(404).json({ error: 'stakeholder not found' });
+  }
   db.prepare('UPDATE stakeholders SET is_authorized = ? WHERE id = ?').run(
     is_authorized ? 1 : 0,
     req.params.id
@@ -48,10 +161,12 @@ app.patch('/api/stakeholders/:id/authorize', (req, res) => {
 // ---------------------------------------------------------------------
 // Batches & Medicine registration (Manufacturer)
 // ---------------------------------------------------------------------
-app.post('/api/batches', (req, res) => {
+app.post('/api/batches', authenticate, requireRole('manufacturer'), (req, res) => {
+  // Identity comes from the login token — the client cannot register
+  // batches on behalf of another manufacturer.
+  const manufacturer_id = req.user.stakeholder_id;
   const {
     medicine_name,
-    manufacturer_id,
     manufacturing_date,
     expiry_date,
     quantity,
@@ -110,31 +225,36 @@ app.post('/api/batches', (req, res) => {
   res.json({ batchId, count: medicines.length, medicines });
 });
 
-app.get('/api/batches', (req, res) => {
-  res.json(db.prepare('SELECT * FROM batches ORDER BY created_at DESC').all());
+app.get('/api/batches', authenticate, requireRole('regulator', 'manufacturer'), (req, res) => {
+  const rows =
+    req.user.role === 'regulator'
+      ? db.prepare('SELECT * FROM batches ORDER BY created_at DESC').all()
+      : db.prepare('SELECT * FROM batches WHERE manufacturer_id = ? ORDER BY created_at DESC').all(req.user.stakeholder_id);
+  res.json(rows);
 });
 
 // ---------------------------------------------------------------------
 // Medicines
 // ---------------------------------------------------------------------
-app.get('/api/medicines', (req, res) => {
-  const { owner_id } = req.query;
+app.get('/api/medicines', authenticate, (req, res) => {
+  // Everyone except the regulator only ever sees the units they hold.
+  const owner_id = req.user.role === 'regulator' ? req.query.owner_id : req.user.stakeholder_id;
   const rows = owner_id
     ? db.prepare('SELECT * FROM medicines WHERE current_owner_id = ? ORDER BY created_at DESC').all(owner_id)
     : db.prepare('SELECT * FROM medicines ORDER BY created_at DESC').all();
   res.json(rows);
 });
 
-app.get('/api/medicines/:id', (req, res) => {
+app.get('/api/medicines/:id', authenticate, (req, res) => {
   const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id);
-  if (!med) return res.status(404).json({ error: 'not found' });
+  if (!med || !canViewMedicine(req.user, med)) return res.status(404).json({ error: 'not found' });
   res.json(med);
 });
 
 // QR code generation for a medicine unit
-app.get('/api/medicines/:id/qrcode', async (req, res) => {
+app.get('/api/medicines/:id/qrcode', authenticate, async (req, res) => {
   const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id);
-  if (!med) return res.status(404).json({ error: 'not found' });
+  if (!med || !canViewMedicine(req.user, med)) return res.status(404).json({ error: 'not found' });
   const payload = JSON.stringify({ serial: med.serial_number, id: med.id });
   try {
     const dataUrl = await QRCode.toDataURL(payload, { width: 260, margin: 1 });
@@ -148,10 +268,19 @@ app.get('/api/medicines/:id/qrcode', async (req, res) => {
 // ---------------------------------------------------------------------
 // Transfers (Distributor / Wholesaler / Pharmacy / smart-contract logic)
 // ---------------------------------------------------------------------
-app.post('/api/transfer', (req, res) => {
-  const { medicine_id, from_id, to_id, actor_note, force } = req.body;
+app.post('/api/transfer', authenticate, requireRole(...SUPPLY_ROLES), (req, res) => {
+  const { medicine_id, to_id, actor_note } = req.body;
+  // The sender is ALWAYS the logged-in stakeholder (never a client-supplied id).
+  const from_id = req.user.stakeholder_id;
   const medicine = db.prepare('SELECT * FROM medicines WHERE id = ?').get(medicine_id);
   if (!medicine) return res.status(404).json({ error: 'medicine not found' });
+
+  // Smart-contract rule: only the current owner may transfer a unit
+  // (mirrors require(med.currentOwner == msg.sender) in the Solidity contract).
+  if (medicine.current_owner_id !== from_id) {
+    return res.status(403).json({ error: 'Transfer rejected: you are not the current holder of this unit' });
+  }
+  if (to_id === from_id) return res.status(400).json({ error: 'cannot transfer a unit to yourself' });
 
   const toStakeholder = db.prepare('SELECT * FROM stakeholders WHERE id = ?').get(to_id);
   if (!toStakeholder) return res.status(400).json({ error: 'recipient stakeholder not found' });
@@ -163,10 +292,9 @@ app.post('/api/transfer', (req, res) => {
     actorStakeholder: toStakeholder,
   });
 
-  // Smart-contract style hard rule: block transfer outright if recipient
-  // is not authorized, unless explicitly forced (for demo purposes so
-  // regulators can see what a blocked/flagged transfer looks like).
-  const hardBlock = flags.some((f) => f.type === 'UNAUTHORIZED_PARTICIPANT') && !force;
+  // Smart-contract style hard rule: block the transfer outright if the
+  // recipient is not an authorized stakeholder, and log the attempt.
+  const hardBlock = flags.some((f) => f.type === 'UNAUTHORIZED_PARTICIPANT');
   if (hardBlock) {
     flags.forEach((f) => anomaly.recordAnomaly(db, medicine_id, f.type, f.severity, f.description));
     anomaly.recalculateScore(db, medicine_id);
@@ -203,8 +331,9 @@ app.post('/api/transfer', (req, res) => {
 // ---------------------------------------------------------------------
 // Scan / verify (Patient-facing + anti-counterfeit check)
 // ---------------------------------------------------------------------
-app.post('/api/scan', (req, res) => {
-  const { serial_number, scanned_by, scan_location } = req.body;
+app.post('/api/scan', authenticate, (req, res) => {
+  const { serial_number, scan_location } = req.body;
+  const scanned_by = `${req.user.username} (${req.user.role})`;
   const medicine = db.prepare('SELECT * FROM medicines WHERE serial_number = ?').get(serial_number);
 
   if (!medicine) {
@@ -246,9 +375,9 @@ app.post('/api/scan', (req, res) => {
 // ---------------------------------------------------------------------
 // Supply chain timeline for a medicine
 // ---------------------------------------------------------------------
-app.get('/api/medicines/:id/timeline', (req, res) => {
+app.get('/api/medicines/:id/timeline', authenticate, (req, res) => {
   const medicine = db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id);
-  if (!medicine) return res.status(404).json({ error: 'not found' });
+  if (!medicine || !canViewMedicine(req.user, medicine)) return res.status(404).json({ error: 'not found' });
   const transfers = db
     .prepare('SELECT * FROM transfers WHERE medicine_id = ? ORDER BY timestamp ASC')
     .all(req.params.id);
@@ -263,10 +392,17 @@ app.get('/api/medicines/:id/timeline', (req, res) => {
 // ---------------------------------------------------------------------
 // Cold-chain / temperature monitoring
 // ---------------------------------------------------------------------
-app.post('/api/temperature', (req, res) => {
+app.post('/api/temperature', authenticate, requireRole(...SUPPLY_ROLES), (req, res) => {
   const { medicine_id, temperature } = req.body;
+  if (typeof temperature !== 'number' || !Number.isFinite(temperature)) {
+    return res.status(400).json({ error: 'temperature must be a number' });
+  }
   const medicine = db.prepare('SELECT * FROM medicines WHERE id = ?').get(medicine_id);
   if (!medicine) return res.status(404).json({ error: 'medicine not found' });
+  // Only the party currently holding the unit can log its cold-chain readings.
+  if (medicine.current_owner_id !== req.user.stakeholder_id) {
+    return res.status(403).json({ error: 'You can only log readings for units you currently hold' });
+  }
   const batch = db.prepare('SELECT * FROM batches WHERE id = ?').get(medicine.batch_id);
 
   let violation = 0;
@@ -292,7 +428,9 @@ app.post('/api/temperature', (req, res) => {
   res.json({ violation: !!violation });
 });
 
-app.get('/api/medicines/:id/temperature', (req, res) => {
+app.get('/api/medicines/:id/temperature', authenticate, (req, res) => {
+  const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id);
+  if (!med || !canViewMedicine(req.user, med)) return res.status(404).json({ error: 'not found' });
   res.json(
     db
       .prepare('SELECT * FROM temperature_logs WHERE medicine_id = ? ORDER BY timestamp ASC')
@@ -303,7 +441,7 @@ app.get('/api/medicines/:id/temperature', (req, res) => {
 // ---------------------------------------------------------------------
 // Regulator dashboard
 // ---------------------------------------------------------------------
-app.get('/api/regulator/overview', (req, res) => {
+app.get('/api/regulator/overview', authenticate, requireRole('regulator'), (req, res) => {
   const totals = db.prepare('SELECT COUNT(*) AS c FROM medicines').get().c;
   const byClass = db
     .prepare('SELECT classification, COUNT(*) AS c FROM medicines GROUP BY classification')
@@ -319,7 +457,7 @@ app.get('/api/regulator/overview', (req, res) => {
   res.json({ totals, byClass, anomalies, flaggedTransfers, chainIntegrity, chainLength: ledger.chain.length });
 });
 
-app.get('/api/regulator/anomalies', (req, res) => {
+app.get('/api/regulator/anomalies', authenticate, requireRole('regulator'), (req, res) => {
   const rows = db
     .prepare(
       `SELECT anomalies.*, medicines.serial_number, medicines.medicine_name
@@ -330,7 +468,7 @@ app.get('/api/regulator/anomalies', (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/regulator/chain', (req, res) => {
+app.get('/api/regulator/chain', authenticate, requireRole('regulator'), (req, res) => {
   res.json({ chain: ledger.chain, integrity: ledger.verifyChainIntegrity() });
 });
 
@@ -339,4 +477,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true, chainLength: ledger.ch
 
 app.listen(PORT, () => {
   console.log(`MediTrack backend running on http://localhost:${PORT}`);
+  if (auth.SECRET_IS_EPHEMERAL) {
+    console.warn('[auth] JWT_SECRET not set — using a random secret, so sessions reset on restart. Copy .env.example to .env to keep them.');
+  }
 });

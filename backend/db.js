@@ -1,7 +1,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, 'meditrack.db'));
+const db = new Database(process.env.DB_PATH || path.join(__dirname, 'meditrack.db'));
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -21,6 +21,14 @@ CREATE TABLE IF NOT EXISTS stakeholders (
   location TEXT,
   registered_at INTEGER NOT NULL,
   is_authorized INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
+  stakeholder_id TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS batches (

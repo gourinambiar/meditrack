@@ -18,6 +18,7 @@
 const db = require('./db');
 const { Ledger } = require('./blockchain');
 const anomaly = require('./anomaly');
+const { createDemoUsers, DEMO_PASSWORD } = require('./demoUsers');
 const { v4: uuidv4 } = require('uuid');
 
 // Seeding must be idempotent: wipe any existing data first so re-running
@@ -26,6 +27,7 @@ const { v4: uuidv4 } = require('uuid');
 // whatever was there before (which breaks the "Acting as" dropdowns and
 // makes previously-shipped units seem to vanish).
 db.exec(`
+  DELETE FROM users;
   DELETE FROM anomalies;
   DELETE FROM temperature_logs;
   DELETE FROM scans;
@@ -167,4 +169,9 @@ console.log({
   clonedCounterfeit: cloned.serial,
   suspiciousTransfer: suspicious.serial,
 });
+const users = createDemoUsers();
+console.log(`\n=== Demo logins (password for all: ${DEMO_PASSWORD}) ===`);
+users.forEach((u) => console.log(`  ${u.username.padEnd(14)} ${u.role.padEnd(12)} ${u.name}`));
+console.log('  (Unverified Reseller Co. is unauthorized and has no login — by design.)');
+
 console.log('\nSeeding complete.');
